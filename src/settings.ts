@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type SftpSyncPlugin from "./main";
-import { SftpConnection } from "./sftp";
+import { testSshConnection } from "./remote";
 
 export class SftpSyncSettingTab extends PluginSettingTab {
   plugin: SftpSyncPlugin;
@@ -108,8 +108,7 @@ export class SftpSyncSettingTab extends PluginSettingTab {
         button.setButtonText("Test").onClick(async () => {
           button.setButtonText("Testing...");
           button.setDisabled(true);
-          const conn = new SftpConnection(this.plugin.settings);
-          const result = await conn.testConnection();
+          const result = await testSshConnection(this.plugin.settings);
           button.setButtonText(result.ok ? "Success!" : "Failed");
           button.setDisabled(false);
           setTimeout(() => button.setButtonText("Test"), 3000);
