@@ -45,15 +45,15 @@ obsidian-sftp-sync/
 ```typescript
 interface SftpSyncSettings {
   // 연결
-  host: string;              // 기본값: "kap-instance.dev.9rum.cc"
-  port: number;              // 기본값: 36595
-  username: string;          // 기본값: "bc-user"
+  host: string;              // 기본값: ""
+  port: number;              // 기본값: 22
+  username: string;          // 기본값: ""
   privateKey: string;        // SSH 개인키 내용 (PEM 문자열)
   privateKeyPath: string;    // 또는 키 파일 경로 (둘 중 하나 사용)
   passphrase: string;        // 키 암호 (있는 경우)
 
   // 경로
-  remotePath: string;        // 기본값: "/data/ib-a100-cluster-b-pri-vcga_940/workspace/mag/Github/DiffSynth-Distill"
+  remotePath: string;        // 기본값: ""
 
   // 동기화
   autoSyncIntervalSec: number;  // 자동 동기화 간격 (초). 기본값: 180 (3분)

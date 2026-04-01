@@ -4,3 +4,4 @@ main.js
 dist/
 coverage/
 .env
+.claude/

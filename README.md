@@ -62,9 +62,9 @@ Settings → SFTP Sync에서 설정 가능:
 ### Connection
 | 항목 | 설명 | 기본값 |
 |---|---|---|
-| Host | SFTP 서버 주소 | `kap-instance.dev.9rum.cc` |
-| Port | SFTP 포트 | `36595` |
-| Username | SSH 사용자명 | `bc-user` |
+| Host | SFTP 서버 주소 | - |
+| Port | SFTP 포트 | `22` |
+| Username | SSH 사용자명 | - |
 | Private key | SSH 개인키 (PEM) 직접 입력 | - |
 | Private key path | 또는 키 파일 경로 | - |
 | Passphrase | 키 암호 (있는 경우) | - |

@@ -26,14 +26,13 @@ export interface SftpSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: SftpSyncSettings = {
-  host: "kap-instance.dev.9rum.cc",
-  port: 36595,
-  username: "bc-user",
+  host: "",
+  port: 22,
+  username: "",
   privateKey: "",
   privateKeyPath: "",
   passphrase: "",
-  remotePath:
-    "/data/ib-a100-cluster-b-pri-vcga_940/workspace/mag/Github/DiffSynth-Distill",
+  remotePath: "",
   autoSyncIntervalSec: 180,
   syncOnStartup: true,
   syncDirection: "bidirectional",
