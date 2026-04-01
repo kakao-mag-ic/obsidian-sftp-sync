@@ -197,11 +197,10 @@ function buildRsyncSshArg(settings: SftpSyncSettings): string {
 }
 
 /**
- * Build common rsync args: --exclude, --max-size, --protect-args, --no-links.
+ * Build common rsync args: --exclude, --max-size, --no-links.
  */
 function buildFilterArgs(settings: SftpSyncSettings, ignorePatterns: string[]): string[] {
   const args: string[] = [
-    "--protect-args",  // safely handle spaces/unicode in remote paths
     "--no-links",      // skip symlinks to prevent path traversal
   ];
   for (const p of ignorePatterns) {
@@ -289,7 +288,7 @@ export function rsyncPushFile(
     const sshArg = buildRsyncSshArg(settings);
     const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
     const args = [
-      "-az", "--relative", "--protect-args", "--no-links",
+      "-az", "--relative", "--no-links",
       "-e", sshArg,
     ];
     if (settings.maxFileSizeMB > 0) {
@@ -323,7 +322,7 @@ export function rsyncPullFile(
       fs.mkdirSync(localDir, { recursive: true });
     }
 
-    const args = ["-az", "--protect-args", "--no-links", "-e", sshArg];
+    const args = ["-az", "--no-links", "-e", sshArg];
     if (settings.maxFileSizeMB > 0) {
       args.push("--max-size", `${settings.maxFileSizeMB}m`);
     }
