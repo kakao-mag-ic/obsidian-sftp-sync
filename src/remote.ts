@@ -1,4 +1,3 @@
-import { Client } from "ssh2";
 import { execFile } from "child_process";
 import * as fs from "fs";
 import type { SftpSyncSettings, FileInfo } from "./types";
@@ -25,76 +24,37 @@ function validateRelativePath(relativePath: string): void {
 }
 
 /**
- * Build SSH connection config from settings.
+ * Build SSH command args array for execFile.
  */
-function buildSshConfig(settings: SftpSyncSettings) {
-  const config: any = {
-    host: settings.host,
-    port: settings.port,
-    username: settings.username,
-    readyTimeout: settings.connectTimeoutMs,
-  };
-
-  if (settings.privateKey) {
-    try {
-      config.privateKey = Buffer.from(settings.privateKey, "base64").toString("utf-8");
-    } catch {
-      config.privateKey = settings.privateKey;
-    }
-  } else if (settings.privateKeyPath) {
-    config.privateKey = fs.readFileSync(settings.privateKeyPath, "utf-8");
+function buildSshArgs(settings: SftpSyncSettings): string[] {
+  const args: string[] = [
+    "-p", String(settings.port),
+  ];
+  if (settings.privateKeyPath) {
+    args.push("-i", settings.privateKeyPath);
   }
-
-  if (settings.passphrase) {
-    config.passphrase = settings.passphrase;
+  if (!settings.strictHostKeyChecking) {
+    args.push("-o", "StrictHostKeyChecking=no");
   }
-
-  return config;
+  args.push("-o", `ConnectTimeout=${Math.ceil(settings.connectTimeoutMs / 1000)}`);
+  args.push(`${settings.username}@${settings.host}`);
+  return args;
 }
 
 /**
- * Execute a command on the remote server via SSH and return stdout.
- * Includes a command execution timeout (not just connection timeout).
+ * Execute a command on the remote server via the ssh binary.
+ * Uses execFile (no shell) with a timeout.
  */
 export function sshExec(settings: SftpSyncSettings, command: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const conn = new Client();
-    let stdout = "";
-    let stderr = "";
-    let done = false;
-
-    const timeoutId = setTimeout(() => {
-      if (!done) {
-        done = true;
-        try { conn.end(); } catch { /* ignore */ }
-        reject(new Error(`SSH command timed out after ${SSH_COMMAND_TIMEOUT_MS}ms`));
-      }
-    }, SSH_COMMAND_TIMEOUT_MS);
-
-    const finish = (err?: Error) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timeoutId);
-      try { conn.end(); } catch { /* ignore */ }
-      if (err) reject(err);
-      else resolve(stdout);
-    };
-
-    conn.on("ready", () => {
-      conn.exec(command, (err, stream) => {
-        if (err) return finish(err);
-        stream.on("data", (data: Buffer) => {
-          stdout += data.toString();
-        });
-        stream.stderr.on("data", (data: Buffer) => {
-          stderr += data.toString();
-        });
-        stream.on("close", () => finish());
-      });
+    const args = [...buildSshArgs(settings), command];
+    execFile("ssh", args, {
+      timeout: SSH_COMMAND_TIMEOUT_MS,
+      maxBuffer: 10 * 1024 * 1024,
+    }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
     });
-
-    conn.on("error", (err) => finish(err));
-    conn.connect(buildSshConfig(settings));
   });
 }
 
@@ -221,18 +181,19 @@ export async function deleteRemoteFiles(
 }
 
 /**
- * Build rsync SSH command args.
- * privateKeyPath is properly escaped.
+ * Build rsync -e "ssh ..." arg string.
+ * Reuses the same SSH options as sshExec.
  */
 function buildRsyncSshArg(settings: SftpSyncSettings): string {
-  let sshCmd = `ssh -p ${settings.port}`;
+  const parts = ["ssh", "-p", String(settings.port)];
   if (settings.privateKeyPath) {
-    sshCmd += ` -i ${shellEscape(settings.privateKeyPath)}`;
+    parts.push("-i", shellEscape(settings.privateKeyPath));
   }
   if (!settings.strictHostKeyChecking) {
-    sshCmd += " -o StrictHostKeyChecking=no";
+    parts.push("-o", "StrictHostKeyChecking=no");
   }
-  return sshCmd;
+  parts.push("-o", `ConnectTimeout=${Math.ceil(settings.connectTimeoutMs / 1000)}`);
+  return parts.join(" ");
 }
 
 /**

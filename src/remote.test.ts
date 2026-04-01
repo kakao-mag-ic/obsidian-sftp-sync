@@ -2,22 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { DEFAULT_SETTINGS } from "./types";
 import type { SftpSyncSettings } from "./types";
 
-// Mock ssh2 Client
-const mockStream = {
-  on: vi.fn(),
-  stderr: { on: vi.fn() },
-};
-const mockConn = {
-  on: vi.fn(),
-  connect: vi.fn(),
-  exec: vi.fn(),
-  end: vi.fn(),
-};
-vi.mock("ssh2", () => ({
-  Client: vi.fn(() => mockConn),
-}));
-
-// Mock child_process
+// Mock child_process - all SSH and rsync calls go through execFile
 vi.mock("child_process", () => ({
   execFile: vi.fn(),
 }));
@@ -29,39 +14,51 @@ function settings(overrides: Partial<SftpSyncSettings> = {}): SftpSyncSettings {
   return { ...DEFAULT_SETTINGS, host: "myhost", port: 22, username: "user", ...overrides };
 }
 
+function mockExecFileSuccess(stdout: string) {
+  (execFile as any).mockImplementation(
+    (_cmd: string, _args: string[], _opts: any, cb: Function) => cb(null, stdout, "")
+  );
+}
+
+function mockExecFileError(message: string) {
+  (execFile as any).mockImplementation(
+    (_cmd: string, _args: string[], _opts: any, cb: Function) =>
+      cb(new Error(message), "", message)
+  );
+}
+
 describe("sshExec", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("should execute command and return stdout", async () => {
-    // Setup: conn.on('ready') triggers exec, stream.on('data') returns data, stream.on('close') resolves
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "ready") setTimeout(() => cb(), 0);
-      return mockConn;
-    });
-    mockConn.exec.mockImplementation((_cmd: string, cb: Function) => {
-      cb(null, mockStream);
-    });
-    mockStream.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "data") setTimeout(() => cb(Buffer.from("hello\n")), 0);
-      if (event === "close") setTimeout(() => cb(), 10);
-      return mockStream;
-    });
-    mockStream.stderr.on.mockReturnValue(mockStream);
+  it("should execute command via ssh binary and return stdout", async () => {
+    mockExecFileSuccess("hello\n");
 
     const result = await sshExec(settings(), "echo hello");
     expect(result).toBe("hello\n");
-    expect(mockConn.exec).toHaveBeenCalledWith("echo hello", expect.any(Function));
+    expect(execFile).toHaveBeenCalledWith(
+      "ssh",
+      expect.arrayContaining(["-p", "22", "user@myhost", "echo hello"]),
+      expect.any(Object),
+      expect.any(Function)
+    );
   });
 
   it("should reject on connection error", async () => {
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "error") setTimeout(() => cb(new Error("Connection refused")), 0);
-      return mockConn;
-    });
-
+    mockExecFileError("Connection refused");
     await expect(sshExec(settings(), "test")).rejects.toThrow("Connection refused");
+  });
+
+  it("should include private key path in args", async () => {
+    mockExecFileSuccess("ok");
+    await sshExec(settings({ privateKeyPath: "/path/to/key" }), "echo ok");
+    expect(execFile).toHaveBeenCalledWith(
+      "ssh",
+      expect.arrayContaining(["-i", "/path/to/key"]),
+      expect.any(Object),
+      expect.any(Function)
+    );
   });
 });
 
@@ -71,30 +68,13 @@ describe("testSshConnection", () => {
   });
 
   it("should return ok:true on success", async () => {
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "ready") setTimeout(() => cb(), 0);
-      return mockConn;
-    });
-    mockConn.exec.mockImplementation((_cmd: string, cb: Function) => {
-      cb(null, mockStream);
-    });
-    mockStream.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "data") setTimeout(() => cb(Buffer.from("ok\n")), 0);
-      if (event === "close") setTimeout(() => cb(), 10);
-      return mockStream;
-    });
-    mockStream.stderr.on.mockReturnValue(mockStream);
-
+    mockExecFileSuccess("ok\n");
     const result = await testSshConnection(settings());
     expect(result.ok).toBe(true);
   });
 
   it("should return ok:false on failure", async () => {
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "error") setTimeout(() => cb(new Error("Timeout")), 0);
-      return mockConn;
-    });
-
+    mockExecFileError("Timeout");
     const result = await testSshConnection(settings());
     expect(result.ok).toBe(false);
     expect(result.message).toContain("Timeout");
@@ -113,19 +93,7 @@ describe("listRemoteFiles", () => {
       "",
     ].join("\n");
 
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "ready") setTimeout(() => cb(), 0);
-      return mockConn;
-    });
-    mockConn.exec.mockImplementation((_cmd: string, cb: Function) => {
-      cb(null, mockStream);
-    });
-    mockStream.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "data") setTimeout(() => cb(Buffer.from(findOutput)), 0);
-      if (event === "close") setTimeout(() => cb(), 10);
-      return mockStream;
-    });
-    mockStream.stderr.on.mockReturnValue(mockStream);
+    mockExecFileSuccess(findOutput);
 
     const s = settings({ remotePath: "/remote/path" });
     const files = await listRemoteFiles(s, [".git", "node_modules", "*.pyc"]);
@@ -146,22 +114,16 @@ describe("listRemoteFiles", () => {
   });
 
   it("should handle empty output", async () => {
-    mockConn.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "ready") setTimeout(() => cb(), 0);
-      return mockConn;
-    });
-    mockConn.exec.mockImplementation((_cmd: string, cb: Function) => {
-      cb(null, mockStream);
-    });
-    mockStream.on.mockImplementation((event: string, cb: Function) => {
-      if (event === "data") setTimeout(() => cb(Buffer.from("")), 0);
-      if (event === "close") setTimeout(() => cb(), 10);
-      return mockStream;
-    });
-    mockStream.stderr.on.mockReturnValue(mockStream);
-
+    mockExecFileSuccess("");
     const files = await listRemoteFiles(settings({ remotePath: "/remote" }), []);
     expect(files).toHaveLength(0);
+  });
+
+  it("should skip paths containing ..", async () => {
+    mockExecFileSuccess("1700000000.0 100 ../../etc/passwd\n1700000000.0 200 safe.md\n");
+    const files = await listRemoteFiles(settings({ remotePath: "/remote" }), []);
+    expect(files).toHaveLength(1);
+    expect(files[0].path).toBe("safe.md");
   });
 });
 
@@ -172,9 +134,7 @@ describe("rsync", () => {
 
   it("rsyncPull should call execFile with correct args", async () => {
     const { rsyncPull } = await import("./remote");
-    (execFile as any).mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, cb: Function) => cb(null, "", "")
-    );
+    mockExecFileSuccess("");
 
     await rsyncPull(
       settings({ privateKeyPath: "/key", remotePath: "/remote" }),
@@ -183,7 +143,7 @@ describe("rsync", () => {
 
     expect(execFile).toHaveBeenCalledWith(
       "rsync",
-      expect.arrayContaining(["-az"]),
+      expect.arrayContaining(["-az", "--protect-args", "--no-links"]),
       expect.any(Object),
       expect.any(Function)
     );
@@ -191,9 +151,7 @@ describe("rsync", () => {
 
   it("rsyncPush should call execFile with correct args", async () => {
     const { rsyncPush } = await import("./remote");
-    (execFile as any).mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, cb: Function) => cb(null, "", "")
-    );
+    mockExecFileSuccess("");
 
     await rsyncPush(
       settings({ privateKeyPath: "/key", remotePath: "/remote" }),
@@ -202,7 +160,7 @@ describe("rsync", () => {
 
     expect(execFile).toHaveBeenCalledWith(
       "rsync",
-      expect.arrayContaining(["-az"]),
+      expect.arrayContaining(["-az", "--protect-args", "--no-links"]),
       expect.any(Object),
       expect.any(Function)
     );
