@@ -223,11 +223,8 @@ export default class SftpSyncPlugin extends Plugin {
       }
 
       this.updateStatusBar(failedCount > 0 ? "failed" : "success");
-      if (syncedCount > 0 || failedCount > 0) {
-        const msg = failedCount > 0
-          ? `SFTP: Pushed ${syncedCount}, failed ${failedCount}`
-          : `SFTP: Pushed ${syncedCount} file(s)`;
-        new Notice(msg);
+      if (failedCount > 0) {
+        new Notice(`SFTP: Pushed ${syncedCount}, failed ${failedCount}`);
       }
     } catch (err: any) {
       console.error("SFTP push error:", err);
@@ -298,7 +295,6 @@ export default class SftpSyncPlugin extends Plugin {
 
       this.lastRemotePollTime = Date.now();
       this.updateStatusBar("success");
-      new Notice(`SFTP: Pulled ${toPull.length} file(s)`);
     } catch (err: any) {
       console.error("SFTP remote poll error:", err);
     } finally {
@@ -371,17 +367,11 @@ export default class SftpSyncPlugin extends Plugin {
 
     if (direction === "push_only") {
       await rsyncPush(this.settings, vaultPath, ignorePatterns, deleteSync);
-      new Notice("SFTP: Push complete");
     } else if (direction === "pull_only") {
       await rsyncPull(this.settings, vaultPath, ignorePatterns, deleteSync);
-      new Notice("SFTP: Pull complete");
     } else {
-      // Bidirectional first sync:
-      // rsync pull (remote → local), then rsync push (local → remote)
-      // Both use trailing slashes = content sync, no nesting
       await rsyncPull(this.settings, vaultPath, ignorePatterns);
       await rsyncPush(this.settings, vaultPath, ignorePatterns);
-      new Notice("SFTP: Initial sync complete");
     }
   }
 
@@ -458,11 +448,8 @@ export default class SftpSyncPlugin extends Plugin {
       }
     }
 
-    if (syncedCount > 0 || failedCount > 0) {
-      const msg = failedCount > 0
-        ? `SFTP: Synced ${syncedCount}, failed ${failedCount}`
-        : `SFTP: Synced ${syncedCount} file(s)`;
-      new Notice(msg);
+    if (failedCount > 0) {
+      new Notice(`SFTP: Synced ${syncedCount}, failed ${failedCount}`);
     }
   }
 
