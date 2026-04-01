@@ -12,8 +12,7 @@ import {
   deleteRemoteFiles,
   rsyncPull,
   rsyncPush,
-  rsyncPullFile,
-  rsyncPushFile,
+  rsyncFiles,
 } from "./remote";
 import * as path from "path";
 import * as fs from "fs";
@@ -24,32 +23,25 @@ export default class SftpSyncPlugin extends Plugin {
   isSyncing = false;
   statusBarItem: HTMLElement | null = null;
 
-  // File watcher
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingLocalChanges: Set<string> = new Set();
 
-  // Anti-echo: files recently pulled from remote, skip in local watcher
   private recentlyPulled: Set<string> = new Set();
   private recentlyPulledTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
-  // Remote polling
   private remotePollTimer: number | null = null;
   private lastRemotePollTime: number = Date.now();
 
-  // Full sync timer
   private autoSyncTimer: number | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
 
-    // Status bar
     this.statusBarItem = this.addStatusBarItem();
     this.updateStatusBar("ready");
 
-    // Settings tab
     this.addSettingTab(new SftpSyncSettingTab(this.app, this));
 
-    // Commands
     this.addCommand({
       id: "sftp-sync-run",
       name: "Run sync now",
@@ -62,15 +54,12 @@ export default class SftpSyncPlugin extends Plugin {
       callback: () => this.testConnection(),
     });
 
-    // Ribbon icon
     this.addRibbonIcon("refresh-cw", "SFTP Sync", () => this.runFullSync());
 
-    // Startup sync
     if (this.settings.syncOnStartup) {
       setTimeout(() => this.runFullSync(), 5000);
     }
 
-    // Start watchers
     this.startLocalWatcher();
     this.startRemotePoller();
     this.startAutoSync();
@@ -80,9 +69,7 @@ export default class SftpSyncPlugin extends Plugin {
     this.stopAutoSync();
     this.stopRemotePoller();
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    for (const timer of this.recentlyPulledTimers.values()) {
-      clearTimeout(timer);
-    }
+    for (const timer of this.recentlyPulledTimers.values()) clearTimeout(timer);
   }
 
   async loadSettings(): Promise<void> {
@@ -93,15 +80,12 @@ export default class SftpSyncPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  /** Restart all timers/watchers when settings change. */
   restartTimers(): void {
     this.stopAutoSync();
     this.stopRemotePoller();
     this.startAutoSync();
     this.startRemotePoller();
   }
-
-  // ---- Anti-echo helpers ----
 
   private markAsPulled(filePath: string): void {
     this.recentlyPulled.add(filePath);
@@ -114,7 +98,9 @@ export default class SftpSyncPlugin extends Plugin {
     this.recentlyPulledTimers.set(filePath, timer);
   }
 
-  // ---- Connection test ----
+  private markManyAsPulled(paths: string[]): void {
+    for (const p of paths) this.markAsPulled(p);
+  }
 
   async testConnection(): Promise<void> {
     const result = await testSshConnection(this.settings);
@@ -124,8 +110,7 @@ export default class SftpSyncPlugin extends Plugin {
   // ---- Local file watcher ----
 
   startLocalWatcher(): void {
-    const direction = this.settings.syncDirection;
-    if (direction === "pull_only") return;
+    if (this.settings.syncDirection === "pull_only") return;
 
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
@@ -157,10 +142,8 @@ export default class SftpSyncPlugin extends Plugin {
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        if (!shouldIgnore(file.path, this.settings.ignorePaths)) {
-          if (!this.recentlyPulled.has(file.path)) {
-            this.pendingLocalChanges.add(file.path);
-          }
+        if (!shouldIgnore(file.path, this.settings.ignorePaths) && !this.recentlyPulled.has(file.path)) {
+          this.pendingLocalChanges.add(file.path);
         }
         if (!shouldIgnore(oldPath, this.settings.ignorePaths) && this.settings.deleteSync) {
           this.pendingLocalChanges.add(`__DELETE__:${oldPath}`);
@@ -176,6 +159,10 @@ export default class SftpSyncPlugin extends Plugin {
     this.debounceTimer = setTimeout(() => this.flushLocalChanges(), debounceMs);
   }
 
+  /**
+   * Flush pending local changes: batch push files in a single rsync call,
+   * then handle deletions.
+   */
   private async flushLocalChanges(): Promise<void> {
     if (this.isSyncing || this.pendingLocalChanges.size === 0) return;
 
@@ -187,37 +174,51 @@ export default class SftpSyncPlugin extends Plugin {
     this.pendingLocalChanges.clear();
 
     try {
-      let syncedCount = 0;
-      let failedCount = 0;
+      // Separate file pushes from deletions
+      const filesToPush: string[] = [];
+      const filesToDelete: string[] = [];
 
       for (const change of changes) {
         if (change.startsWith("__DELETE__:")) {
-          const filePath = change.slice("__DELETE__:".length);
-          try {
-            await deleteRemoteFiles(this.settings, [filePath]);
-            await this.syncState.deleteRecord(filePath);
-            syncedCount++;
-          } catch (err) {
-            console.error(`SFTP: Failed to delete remote ${filePath}`, err);
-            failedCount++;
-          }
+          filesToDelete.push(change.slice("__DELETE__:".length));
         } else {
-          try {
-            await rsyncPushFile(this.settings, vaultPath, change);
-            const localFull = path.join(vaultPath, change);
-            if (fs.existsSync(localFull)) {
+          filesToPush.push(change);
+        }
+      }
+
+      let syncedCount = 0;
+      let failedCount = 0;
+
+      // Batch push all changed files in ONE rsync call
+      if (filesToPush.length > 0) {
+        try {
+          await rsyncFiles(this.settings, vaultPath, filesToPush, "push");
+          // Update records for pushed files
+          for (const f of filesToPush) {
+            const localFull = path.join(vaultPath, f);
+            try {
               const stats = fs.statSync(localFull);
-              await this.syncState.setRecord(change, {
-                path: change,
-                mtime: stats.mtimeMs,
-                size: stats.size,
+              await this.syncState.setRecord(f, {
+                path: f, mtime: stats.mtimeMs, size: stats.size,
               });
-            }
-            syncedCount++;
-          } catch (err) {
-            console.error(`SFTP: Failed to push ${change}`, err);
-            failedCount++;
+            } catch { /* file may have been deleted */ }
           }
+          syncedCount += filesToPush.length;
+        } catch (err) {
+          console.error("SFTP: Failed to push files", err);
+          failedCount += filesToPush.length;
+        }
+      }
+
+      // Batch delete remote files
+      if (filesToDelete.length > 0) {
+        try {
+          await deleteRemoteFiles(this.settings, filesToDelete);
+          for (const f of filesToDelete) await this.syncState.deleteRecord(f);
+          syncedCount += filesToDelete.length;
+        } catch (err) {
+          console.error("SFTP: Failed to delete remote files", err);
+          failedCount += filesToDelete.length;
         }
       }
 
@@ -239,8 +240,7 @@ export default class SftpSyncPlugin extends Plugin {
   // ---- Remote polling ----
 
   startRemotePoller(): void {
-    const direction = this.settings.syncDirection;
-    if (direction === "push_only") return;
+    if (this.settings.syncDirection === "push_only") return;
 
     this.lastRemotePollTime = Date.now();
     const pollMs = (this.settings.pullIntervalSec || 30) * 1000;
@@ -260,7 +260,7 @@ export default class SftpSyncPlugin extends Plugin {
 
   private async pollRemoteChanges(): Promise<void> {
     if (this.isSyncing) return;
-    this.isSyncing = true; // set immediately to prevent races
+    this.isSyncing = true;
 
     try {
       const changedFiles = await listRemoteChangedFiles(
@@ -272,33 +272,33 @@ export default class SftpSyncPlugin extends Plugin {
       if (changedFiles.length === 0) return;
 
       this.updateStatusBar("syncing");
-
       const vaultPath = (this.app.vault.adapter as any).getBasePath();
-      let syncedCount = 0;
 
-      for (const remoteFile of changedFiles) {
-        const record = await this.syncState.getRecord(remoteFile.path);
-        if (record && record.mtime >= remoteFile.mtime) continue;
+      // Filter out files we just pushed (anti-echo)
+      const toPull: FileInfo[] = [];
+      for (const rf of changedFiles) {
+        const record = await this.syncState.getRecord(rf.path);
+        if (record && record.mtime >= rf.mtime) continue;
+        toPull.push(rf);
+      }
 
-        try {
-          this.markAsPulled(remoteFile.path);
-          await rsyncPullFile(this.settings, vaultPath, remoteFile.path);
-          await this.syncState.setRecord(remoteFile.path, {
-            path: remoteFile.path,
-            mtime: remoteFile.mtime,
-            size: remoteFile.size,
-          });
-          syncedCount++;
-        } catch (err) {
-          console.error(`SFTP: Failed to pull ${remoteFile.path}`, err);
-        }
+      if (toPull.length === 0) return;
+
+      // Batch pull in ONE rsync call
+      const pullPaths = toPull.map((f) => f.path);
+      this.markManyAsPulled(pullPaths);
+      await rsyncFiles(this.settings, vaultPath, pullPaths, "pull");
+
+      // Update records
+      for (const rf of toPull) {
+        await this.syncState.setRecord(rf.path, {
+          path: rf.path, mtime: rf.mtime, size: rf.size,
+        });
       }
 
       this.lastRemotePollTime = Date.now();
       this.updateStatusBar("success");
-      if (syncedCount > 0) {
-        new Notice(`SFTP: Pulled ${syncedCount} file(s)`);
-      }
+      new Notice(`SFTP: Pulled ${toPull.length} file(s)`);
     } catch (err: any) {
       console.error("SFTP remote poll error:", err);
     } finally {
@@ -306,7 +306,7 @@ export default class SftpSyncPlugin extends Plugin {
     }
   }
 
-  // ---- Full sync (manual / startup / interval) ----
+  // ---- Full sync ----
 
   startAutoSync(): void {
     this.stopAutoSync();
@@ -355,10 +355,9 @@ export default class SftpSyncPlugin extends Plugin {
       this.updateStatusBar("failed");
       new Notice(`SFTP: Sync failed - ${err?.message || "Unknown error"}`);
     } finally {
-      // Always rebuild records so partial progress is captured
       try {
         await this.rebuildSyncRecords(vaultPath);
-      } catch { /* ignore rebuild errors */ }
+      } catch { /* ignore */ }
       this.isSyncing = false;
     }
   }
@@ -377,14 +376,19 @@ export default class SftpSyncPlugin extends Plugin {
       await rsyncPull(this.settings, vaultPath, ignorePatterns, deleteSync);
       new Notice("SFTP: Pull complete");
     } else {
-      // bidirectional first sync: bulk rsync pull then push
-      // rsync with trailing slashes is safe — no nesting risk
+      // Bidirectional first sync:
+      // rsync pull (remote → local), then rsync push (local → remote)
+      // Both use trailing slashes = content sync, no nesting
       await rsyncPull(this.settings, vaultPath, ignorePatterns);
       await rsyncPush(this.settings, vaultPath, ignorePatterns);
       new Notice("SFTP: Initial sync complete");
     }
   }
 
+  /**
+   * Incremental sync: 3-way compare, then batch rsync for downloads/uploads.
+   * Only 2 rsync calls max (1 pull + 1 push) regardless of file count.
+   */
   private async runIncrementalSync(
     vaultPath: string,
     prevRecords: Map<string, SyncRecord>,
@@ -394,9 +398,7 @@ export default class SftpSyncPlugin extends Plugin {
     const localFiles = this.collectLocalFiles(vaultPath);
 
     const plan = buildSyncPlan({
-      localFiles,
-      remoteFiles,
-      prevRecords,
+      localFiles, remoteFiles, prevRecords,
       settings: this.settings,
     });
 
@@ -408,27 +410,30 @@ export default class SftpSyncPlugin extends Plugin {
     let syncedCount = 0;
     let failedCount = 0;
 
-    for (const f of toDownload) {
+    // Batch download — ONE rsync call
+    if (toDownload.length > 0) {
       try {
-        this.markAsPulled(f);
-        await rsyncPullFile(this.settings, vaultPath, f);
-        syncedCount++;
+        this.markManyAsPulled(toDownload);
+        await rsyncFiles(this.settings, vaultPath, toDownload, "pull");
+        syncedCount += toDownload.length;
       } catch (err) {
-        console.error(`SFTP: Failed to pull ${f}`, err);
-        failedCount++;
+        console.error("SFTP: Failed to pull files", err);
+        failedCount += toDownload.length;
       }
     }
 
-    for (const f of toUpload) {
+    // Batch upload — ONE rsync call
+    if (toUpload.length > 0) {
       try {
-        await rsyncPushFile(this.settings, vaultPath, f);
-        syncedCount++;
+        await rsyncFiles(this.settings, vaultPath, toUpload, "push");
+        syncedCount += toUpload.length;
       } catch (err) {
-        console.error(`SFTP: Failed to push ${f}`, err);
-        failedCount++;
+        console.error("SFTP: Failed to push files", err);
+        failedCount += toUpload.length;
       }
     }
 
+    // Delete local files
     for (const entity of toDeleteLocal) {
       try {
         const localFull = path.join(vaultPath, entity.path);
@@ -442,12 +447,10 @@ export default class SftpSyncPlugin extends Plugin {
       }
     }
 
+    // Delete remote files — ONE ssh call
     if (toDeleteRemote.length > 0) {
       try {
-        await deleteRemoteFiles(
-          this.settings,
-          toDeleteRemote.map((e) => e.path)
-        );
+        await deleteRemoteFiles(this.settings, toDeleteRemote.map((e) => e.path));
         syncedCount += toDeleteRemote.length;
       } catch (err) {
         console.error("SFTP: Failed to delete remote files", err);
@@ -472,8 +475,6 @@ export default class SftpSyncPlugin extends Plugin {
     await this.syncState.save(records);
   }
 
-  // ---- Local file collection ----
-
   collectLocalFiles(basePath: string, relativeTo?: string): FileInfo[] {
     const base = relativeTo ?? basePath;
     const results: FileInfo[] = [];
@@ -486,7 +487,6 @@ export default class SftpSyncPlugin extends Plugin {
     }
 
     for (const entry of entries) {
-      // Skip symlinks to prevent path traversal
       if (entry.isSymbolicLink()) continue;
 
       const fullPath = path.join(basePath, entry.name);
@@ -498,8 +498,7 @@ export default class SftpSyncPlugin extends Plugin {
       if (shouldIgnore(relPath, this.settings.ignorePaths)) continue;
 
       if (entry.isDirectory()) {
-        const subFiles = this.collectLocalFiles(fullPath, base);
-        results.push(...subFiles);
+        results.push(...this.collectLocalFiles(fullPath, base));
       } else if (entry.isFile()) {
         try {
           const stats = fs.statSync(fullPath);
@@ -509,16 +508,12 @@ export default class SftpSyncPlugin extends Plugin {
             mtime: stats.mtimeMs,
             isDirectory: false,
           });
-        } catch {
-          // File may have been deleted between readdir and stat
-        }
+        } catch { /* file deleted between readdir and stat */ }
       }
     }
 
     return results;
   }
-
-  // ---- Status bar ----
 
   updateStatusBar(status: SyncStatus): void {
     if (!this.statusBarItem) return;
@@ -542,10 +537,8 @@ export default class SftpSyncPlugin extends Plugin {
       case "offline":
         this.statusBarItem.setText("SFTP: Offline");
         break;
-      case "ready":
       default:
         this.statusBarItem.setText("SFTP: Ready");
-        break;
     }
   }
 }

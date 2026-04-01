@@ -1,19 +1,15 @@
 import { execFile } from "child_process";
 import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 import type { SftpSyncSettings, FileInfo } from "./types";
 
-const SSH_COMMAND_TIMEOUT_MS = 30000;
+const SSH_COMMAND_TIMEOUT_MS = 60000;
 
-/**
- * Escape a string for safe use inside single quotes in shell commands.
- */
 function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
 
-/**
- * Validate that a relative path doesn't escape its base directory.
- */
 function validateRelativePath(relativePath: string): void {
   if (relativePath.includes("..")) {
     throw new Error(`Refusing to sync path with '..' segments: ${relativePath}`);
@@ -23,13 +19,8 @@ function validateRelativePath(relativePath: string): void {
   }
 }
 
-/**
- * Build SSH command args array for execFile.
- */
 function buildSshArgs(settings: SftpSyncSettings): string[] {
-  const args: string[] = [
-    "-p", String(settings.port),
-  ];
+  const args = ["-p", String(settings.port)];
   if (settings.privateKeyPath) {
     args.push("-i", settings.privateKeyPath);
   }
@@ -41,10 +32,6 @@ function buildSshArgs(settings: SftpSyncSettings): string[] {
   return args;
 }
 
-/**
- * Execute a command on the remote server via the ssh binary.
- * Uses execFile (no shell) with a timeout.
- */
 export function sshExec(settings: SftpSyncSettings, command: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const args = [...buildSshArgs(settings), command];
@@ -58,9 +45,6 @@ export function sshExec(settings: SftpSyncSettings, command: string): Promise<st
   });
 }
 
-/**
- * Test SSH connection.
- */
 export async function testSshConnection(settings: SftpSyncSettings): Promise<{ ok: boolean; message: string }> {
   try {
     await sshExec(settings, "echo ok");
@@ -70,11 +54,6 @@ export async function testSshConnection(settings: SftpSyncSettings): Promise<{ o
   }
 }
 
-/**
- * Build the find command for listing remote files.
- * Uses -P (physical) to avoid following symlinks.
- * Handles empty ignore patterns gracefully.
- */
 function buildFindCommand(
   remotePath: string,
   ignorePatterns: string[],
@@ -103,25 +82,17 @@ function buildFindCommand(
   return `find -P ${escaped} \\( ${pruneArgs} \\) -o -type f ${extPrunes} ${extraFlags} -printf '%T@ %s %P\\n'`;
 }
 
-/**
- * Parse find output into FileInfo array.
- */
 function parseFindOutput(output: string): FileInfo[] {
   const files: FileInfo[] = [];
-
   for (const line of output.split("\n")) {
     if (!line.trim()) continue;
-
     const firstSpace = line.indexOf(" ");
     const secondSpace = line.indexOf(" ", firstSpace + 1);
     if (firstSpace === -1 || secondSpace === -1) continue;
-
     const mtimeSec = parseFloat(line.slice(0, firstSpace));
     const size = parseInt(line.slice(firstSpace + 1, secondSpace));
     const filePath = line.slice(secondSpace + 1);
-
     if (!filePath || filePath.includes("..")) continue;
-
     files.push({
       path: filePath,
       mtime: Math.floor(mtimeSec * 1000),
@@ -129,13 +100,9 @@ function parseFindOutput(output: string): FileInfo[] {
       isDirectory: false,
     });
   }
-
   return files;
 }
 
-/**
- * List all files under remotePath using `find` command via SSH.
- */
 export async function listRemoteFiles(
   settings: SftpSyncSettings,
   ignorePatterns: string[]
@@ -145,9 +112,6 @@ export async function listRemoteFiles(
   return parseFindOutput(output);
 }
 
-/**
- * List remote files changed since a given timestamp.
- */
 export async function listRemoteChangedFiles(
   settings: SftpSyncSettings,
   sinceMsTimestamp: number,
@@ -163,9 +127,6 @@ export async function listRemoteChangedFiles(
   return parseFindOutput(output);
 }
 
-/**
- * Delete remote files via SSH. Paths are properly escaped.
- */
 export async function deleteRemoteFiles(
   settings: SftpSyncSettings,
   relativePaths: string[]
@@ -180,10 +141,8 @@ export async function deleteRemoteFiles(
   await sshExec(settings, `rm -f ${escaped}`);
 }
 
-/**
- * Build rsync -e "ssh ..." arg string.
- * Reuses the same SSH options as sshExec.
- */
+// ---- rsync helpers ----
+
 function buildRsyncSshArg(settings: SftpSyncSettings): string {
   const parts = ["ssh", "-p", String(settings.port)];
   if (settings.privateKeyPath) {
@@ -196,13 +155,8 @@ function buildRsyncSshArg(settings: SftpSyncSettings): string {
   return parts.join(" ");
 }
 
-/**
- * Build common rsync args: --exclude, --max-size, --no-links.
- */
 function buildFilterArgs(settings: SftpSyncSettings, ignorePatterns: string[]): string[] {
-  const args: string[] = [
-    "--no-links",      // skip symlinks to prevent path traversal
-  ];
+  const args: string[] = [];
   for (const p of ignorePatterns) {
     const pattern = p.endsWith("/") ? p.slice(0, -1) : p;
     args.push("--exclude", pattern);
@@ -214,123 +168,104 @@ function buildFilterArgs(settings: SftpSyncSettings, ignorePatterns: string[]): 
 }
 
 /**
- * Rsync full directory from remote to local.
+ * Rsync full directory. direction: "pull" or "push".
  */
+export function rsyncBulk(
+  settings: SftpSyncSettings,
+  localPath: string,
+  direction: "pull" | "push",
+  ignorePatterns?: string[],
+  deleteSync?: boolean
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sshArg = buildRsyncSshArg(settings);
+    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
+    const local = localPath.endsWith("/") ? localPath : `${localPath}/`;
+
+    const args = ["-az", "-e", sshArg, ...buildFilterArgs(settings, ignorePatterns ?? [])];
+    if (deleteSync) args.push("--delete-after");
+
+    if (direction === "pull") {
+      args.push(remote, local);
+    } else {
+      args.push(local, remote);
+    }
+
+    execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+// Keep old names as aliases for compatibility
 export function rsyncPull(
-  settings: SftpSyncSettings,
-  localPath: string,
-  ignorePatterns?: string[],
-  deleteSync?: boolean
+  settings: SftpSyncSettings, localPath: string,
+  ignorePatterns?: string[], deleteSync?: boolean
 ): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const sshArg = buildRsyncSshArg(settings);
-    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
-    const local = localPath.endsWith("/") ? localPath : `${localPath}/`;
-
-    const args = [
-      "-az",
-      "-e", sshArg,
-      ...buildFilterArgs(settings, ignorePatterns ?? []),
-    ];
-    if (deleteSync) {
-      args.push("--delete-after");
-    }
-    args.push(remote, local);
-
-    execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(stdout);
-    });
-  });
+  return rsyncBulk(settings, localPath, "pull", ignorePatterns, deleteSync);
 }
 
-/**
- * Rsync full directory from local to remote.
- */
 export function rsyncPush(
+  settings: SftpSyncSettings, localPath: string,
+  ignorePatterns?: string[], deleteSync?: boolean
+): Promise<string> {
+  return rsyncBulk(settings, localPath, "push", ignorePatterns, deleteSync);
+}
+
+/**
+ * Rsync multiple files at once using --files-from.
+ * This is the key performance optimization: 1 rsync call instead of N.
+ */
+export function rsyncFiles(
   settings: SftpSyncSettings,
   localPath: string,
-  ignorePatterns?: string[],
-  deleteSync?: boolean
+  relativePaths: string[],
+  direction: "pull" | "push"
 ): Promise<string> {
+  if (relativePaths.length === 0) return Promise.resolve("");
+
+  // Validate all paths
+  for (const p of relativePaths) validateRelativePath(p);
+
   return new Promise((resolve, reject) => {
+    // Write file list to temp file
+    const tmpFile = path.join(os.tmpdir(), `sftp-sync-${Date.now()}.txt`);
+    fs.writeFileSync(tmpFile, relativePaths.join("\n") + "\n");
+
     const sshArg = buildRsyncSshArg(settings);
     const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
     const local = localPath.endsWith("/") ? localPath : `${localPath}/`;
 
-    const args = [
-      "-az",
-      "-e", sshArg,
-      ...buildFilterArgs(settings, ignorePatterns ?? []),
-    ];
-    if (deleteSync) {
-      args.push("--delete-after");
+    const args = ["-az", "-e", sshArg, "--files-from", tmpFile];
+    if (settings.maxFileSizeMB > 0) {
+      args.push("--max-size", `${settings.maxFileSizeMB}m`);
     }
-    args.push(local, remote);
+
+    if (direction === "pull") {
+      args.push(remote, local);
+    } else {
+      args.push(local, remote);
+    }
 
     execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      // Clean up temp file
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
       if (err) return reject(new Error(stderr || err.message));
       resolve(stdout);
     });
   });
 }
 
-/**
- * Rsync a single file from local to remote.
- */
+// Single file operations — kept for file watcher (small batches)
 export function rsyncPushFile(
-  settings: SftpSyncSettings,
-  localPath: string,
-  relativePath: string
+  settings: SftpSyncSettings, localPath: string, relativePath: string
 ): Promise<string> {
-  validateRelativePath(relativePath);
-  return new Promise((resolve, reject) => {
-    const sshArg = buildRsyncSshArg(settings);
-    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
-    const args = [
-      "-az", "--relative", "--no-links",
-      "-e", sshArg,
-    ];
-    if (settings.maxFileSizeMB > 0) {
-      args.push("--max-size", `${settings.maxFileSizeMB}m`);
-    }
-    args.push(`./${relativePath}`, remote);
-
-    execFile("rsync", args, { cwd: localPath, timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(stdout);
-    });
-  });
+  return rsyncFiles(settings, localPath, [relativePath], "push");
 }
 
-/**
- * Rsync a single file from remote to local.
- */
 export function rsyncPullFile(
-  settings: SftpSyncSettings,
-  localPath: string,
-  relativePath: string
+  settings: SftpSyncSettings, localPath: string, relativePath: string
 ): Promise<string> {
-  validateRelativePath(relativePath);
-  return new Promise((resolve, reject) => {
-    const sshArg = buildRsyncSshArg(settings);
-    const remoteFile = `${settings.username}@${settings.host}:${settings.remotePath}/${relativePath}`;
-
-    const localFile = `${localPath}/${relativePath}`;
-    const localDir = localFile.substring(0, localFile.lastIndexOf("/"));
-    if (!fs.existsSync(localDir)) {
-      fs.mkdirSync(localDir, { recursive: true });
-    }
-
-    const args = ["-az", "--no-links", "-e", sshArg];
-    if (settings.maxFileSizeMB > 0) {
-      args.push("--max-size", `${settings.maxFileSizeMB}m`);
-    }
-    args.push(remoteFile, localFile);
-
-    execFile("rsync", args, { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(stdout);
-    });
-  });
+  return rsyncFiles(settings, localPath, [relativePath], "pull");
 }

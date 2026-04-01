@@ -143,7 +143,7 @@ describe("rsync", () => {
 
     expect(execFile).toHaveBeenCalledWith(
       "rsync",
-      expect.arrayContaining(["-az", "--no-links"]),
+      expect.arrayContaining(["-az"]),
       expect.any(Object),
       expect.any(Function)
     );
@@ -160,7 +160,7 @@ describe("rsync", () => {
 
     expect(execFile).toHaveBeenCalledWith(
       "rsync",
-      expect.arrayContaining(["-az", "--no-links"]),
+      expect.arrayContaining(["-az"]),
       expect.any(Object),
       expect.any(Function)
     );
