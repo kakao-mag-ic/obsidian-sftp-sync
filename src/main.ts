@@ -377,42 +377,11 @@ export default class SftpSyncPlugin extends Plugin {
       await rsyncPull(this.settings, vaultPath, ignorePatterns, deleteSync);
       new Notice("SFTP: Pull complete");
     } else {
-      // bidirectional first sync: per-file to avoid nesting
-      const remoteFiles = await listRemoteFiles(this.settings, ignorePatterns);
-      const localFiles = this.collectLocalFiles(vaultPath);
-      const plan = buildSyncPlan({
-        localFiles,
-        remoteFiles,
-        prevRecords: new Map(),
-        settings: this.settings,
-      });
-
-      const toDownload = plan.filter((e) => e.decision === "download").map((e) => e.path);
-      const toUpload = plan.filter((e) => e.decision === "upload").map((e) => e.path);
-      let failedCount = 0;
-
-      for (const f of toDownload) {
-        try {
-          this.markAsPulled(f);
-          await rsyncPullFile(this.settings, vaultPath, f);
-        } catch (err) {
-          console.error(`SFTP: Failed to pull ${f}`, err);
-          failedCount++;
-        }
-      }
-      for (const f of toUpload) {
-        try {
-          await rsyncPushFile(this.settings, vaultPath, f);
-        } catch (err) {
-          console.error(`SFTP: Failed to push ${f}`, err);
-          failedCount++;
-        }
-      }
-
-      const msg = failedCount > 0
-        ? `SFTP: Initial sync (↓${toDownload.length} ↑${toUpload.length}, ${failedCount} failed)`
-        : `SFTP: Initial sync complete (↓${toDownload.length} ↑${toUpload.length})`;
-      new Notice(msg);
+      // bidirectional first sync: bulk rsync pull then push
+      // rsync with trailing slashes is safe — no nesting risk
+      await rsyncPull(this.settings, vaultPath, ignorePatterns);
+      await rsyncPush(this.settings, vaultPath, ignorePatterns);
+      new Notice("SFTP: Initial sync complete");
     }
   }
 
