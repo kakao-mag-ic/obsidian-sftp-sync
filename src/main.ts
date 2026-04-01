@@ -112,10 +112,11 @@ export default class SftpSyncPlugin extends Plugin {
     }
 
     try {
-      // Collect remote files
-      const remoteFiles = await conn.listRecursive(this.settings.remotePath);
-      const filteredRemote = remoteFiles.filter(
-        (f) => !shouldIgnore(f.path, this.settings.ignorePaths)
+      // Collect remote files (pass ignore patterns to skip .git etc during traversal)
+      const filteredRemote = await conn.listRecursive(
+        this.settings.remotePath,
+        undefined,
+        this.settings.ignorePaths
       );
 
       // Collect local files

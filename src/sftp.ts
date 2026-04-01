@@ -1,5 +1,6 @@
 import SftpClient from "ssh2-sftp-client";
 import type { SftpSyncSettings, FileInfo } from "./types";
+import { shouldIgnore } from "./ignore";
 import * as fs from "fs";
 
 export class SftpConnection {
@@ -91,7 +92,7 @@ export class SftpConnection {
    * Recursively list all files under remotePath.
    * Returns only files (not directories), with paths relative to remotePath.
    */
-  async listRecursive(remotePath: string, relativeTo?: string): Promise<FileInfo[]> {
+  async listRecursive(remotePath: string, relativeTo?: string, ignorePatterns?: string[]): Promise<FileInfo[]> {
     const base = relativeTo ?? remotePath;
     const entries = await this.list(remotePath);
     const results: FileInfo[] = [];
@@ -101,8 +102,13 @@ export class SftpConnection {
         ? entry.path
         : `${remotePath.slice(base.length + 1)}/${entry.path}`;
 
+      // Skip ignored paths early to avoid unnecessary recursion
+      if (ignorePatterns && shouldIgnore(fullPath, ignorePatterns)) {
+        continue;
+      }
+
       if (entry.isDirectory) {
-        const subFiles = await this.listRecursive(`${remotePath}/${entry.path}`, base);
+        const subFiles = await this.listRecursive(`${remotePath}/${entry.path}`, base, ignorePatterns);
         results.push(...subFiles);
       } else {
         results.push({
