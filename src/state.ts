@@ -25,9 +25,18 @@ export class SyncState {
   }
 
   async save(records: Map<string, SyncRecord>): Promise<void> {
-    await this.store.clear();
+    // Write all new records first, then remove stale keys.
+    // This avoids data loss if the process crashes mid-save.
+    const existingKeys = new Set(await this.store.keys());
+
     for (const [key, record] of records) {
       await this.store.setItem(key, record);
+      existingKeys.delete(key);
+    }
+
+    // Remove keys that are no longer in the new records
+    for (const staleKey of existingKeys) {
+      await this.store.removeItem(staleKey);
     }
   }
 

@@ -4,6 +4,25 @@ import * as fs from "fs";
 import type { SftpSyncSettings, FileInfo } from "./types";
 
 /**
+ * Escape a string for safe use inside single quotes in shell commands.
+ */
+function shellEscape(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * Validate that a relative path doesn't escape its base directory.
+ */
+function validateRelativePath(relativePath: string): void {
+  if (relativePath.includes("..")) {
+    throw new Error(`Refusing to sync path with '..' segments: ${relativePath}`);
+  }
+  if (relativePath.startsWith("/")) {
+    throw new Error(`Refusing to sync absolute path: ${relativePath}`);
+  }
+}
+
+/**
  * Build SSH connection config from settings.
  */
 function buildSshConfig(settings: SftpSyncSettings) {
@@ -77,88 +96,42 @@ export async function testSshConnection(settings: SftpSyncSettings): Promise<{ o
 }
 
 /**
- * List all files under remotePath using `find` command via SSH.
- * Returns FileInfo[] with paths relative to remotePath.
+ * Build the find command for listing remote files.
+ * Handles empty ignore patterns gracefully.
  */
-export async function listRemoteFiles(
-  settings: SftpSyncSettings,
-  ignorePatterns: string[]
-): Promise<FileInfo[]> {
-  // Build find command with prune for ignored directories
-  const pruneArgs = ignorePatterns
-    .filter((p) => !p.startsWith("*")) // directory patterns only
+function buildFindCommand(
+  remotePath: string,
+  ignorePatterns: string[],
+  extraFlags: string
+): string {
+  const dirPatterns = ignorePatterns.filter((p) => !p.startsWith("*"));
+  const extPatterns = ignorePatterns.filter((p) => p.startsWith("*."));
+
+  const extPrunes = extPatterns
+    .map((p) => `! -name ${shellEscape(p)}`)
+    .join(" ");
+
+  const escaped = shellEscape(remotePath);
+
+  if (dirPatterns.length === 0) {
+    // No directory prune needed
+    return `find ${escaped} -type f ${extPrunes} ${extraFlags} -printf '%T@ %s %P\\n'`;
+  }
+
+  const pruneArgs = dirPatterns
     .map((p) => {
       const name = p.endsWith("/") ? p.slice(0, -1) : p;
-      return `-name '${name}' -prune`;
+      return `-name ${shellEscape(name)} -prune`;
     })
     .join(" -o ");
 
-  const extPrunes = ignorePatterns
-    .filter((p) => p.startsWith("*."))
-    .map((p) => `! -name '${p}'`)
-    .join(" ");
-
-  // find command: prune ignored dirs, print files with stat info
-  // Output format: <mtime_epoch> <size> <relative_path>
-  const remotePath = settings.remotePath;
-  const cmd = `find '${remotePath}' \\( ${pruneArgs} \\) -o -type f ${extPrunes} -printf '%T@ %s %P\\n'`;
-
-  const output = await sshExec(settings, cmd);
-  const files: FileInfo[] = [];
-
-  for (const line of output.split("\n")) {
-    if (!line.trim()) continue;
-
-    // Parse: "1234567890.123456 1024 path/to/file.md"
-    const firstSpace = line.indexOf(" ");
-    const secondSpace = line.indexOf(" ", firstSpace + 1);
-    if (firstSpace === -1 || secondSpace === -1) continue;
-
-    const mtimeSec = parseFloat(line.slice(0, firstSpace));
-    const size = parseInt(line.slice(firstSpace + 1, secondSpace));
-    const filePath = line.slice(secondSpace + 1);
-
-    if (!filePath) continue;
-
-    files.push({
-      path: filePath,
-      mtime: Math.floor(mtimeSec * 1000), // convert to ms
-      size,
-      isDirectory: false,
-    });
-  }
-
-  return files;
+  return `find ${escaped} \\( ${pruneArgs} \\) -o -type f ${extPrunes} ${extraFlags} -printf '%T@ %s %P\\n'`;
 }
 
 /**
- * List remote files changed since a given timestamp using `find -newer`.
+ * Parse find output into FileInfo array.
  */
-export async function listRemoteChangedFiles(
-  settings: SftpSyncSettings,
-  sinceMsTimestamp: number,
-  ignorePatterns: string[]
-): Promise<FileInfo[]> {
-  const remotePath = settings.remotePath;
-  const sinceSeconds = Math.floor(sinceMsTimestamp / 1000);
-
-  const pruneArgs = ignorePatterns
-    .filter((p) => !p.startsWith("*"))
-    .map((p) => {
-      const name = p.endsWith("/") ? p.slice(0, -1) : p;
-      return `-name '${name}' -prune`;
-    })
-    .join(" -o ");
-
-  const extPrunes = ignorePatterns
-    .filter((p) => p.startsWith("*."))
-    .map((p) => `! -name '${p}'`)
-    .join(" ");
-
-  // Use -newermt with epoch timestamp
-  const cmd = `find '${remotePath}' \\( ${pruneArgs} \\) -o -type f ${extPrunes} -newermt @${sinceSeconds} -printf '%T@ %s %P\\n'`;
-
-  const output = await sshExec(settings, cmd);
+function parseFindOutput(output: string): FileInfo[] {
   const files: FileInfo[] = [];
 
   for (const line of output.split("\n")) {
@@ -172,7 +145,7 @@ export async function listRemoteChangedFiles(
     const size = parseInt(line.slice(firstSpace + 1, secondSpace));
     const filePath = line.slice(secondSpace + 1);
 
-    if (!filePath) continue;
+    if (!filePath || filePath.includes("..")) continue;
 
     files.push({
       path: filePath,
@@ -186,15 +159,63 @@ export async function listRemoteChangedFiles(
 }
 
 /**
+ * List all files under remotePath using `find` command via SSH.
+ * Returns FileInfo[] with paths relative to remotePath.
+ */
+export async function listRemoteFiles(
+  settings: SftpSyncSettings,
+  ignorePatterns: string[]
+): Promise<FileInfo[]> {
+  const cmd = buildFindCommand(settings.remotePath, ignorePatterns, "");
+  const output = await sshExec(settings, cmd);
+  return parseFindOutput(output);
+}
+
+/**
+ * List remote files changed since a given timestamp using `find -newermt`.
+ */
+export async function listRemoteChangedFiles(
+  settings: SftpSyncSettings,
+  sinceMsTimestamp: number,
+  ignorePatterns: string[]
+): Promise<FileInfo[]> {
+  const sinceSeconds = Math.floor(sinceMsTimestamp / 1000);
+  const cmd = buildFindCommand(
+    settings.remotePath,
+    ignorePatterns,
+    `-newermt @${sinceSeconds}`
+  );
+  const output = await sshExec(settings, cmd);
+  return parseFindOutput(output);
+}
+
+/**
+ * Delete remote files via SSH. Paths are properly escaped.
+ */
+export async function deleteRemoteFiles(
+  settings: SftpSyncSettings,
+  relativePaths: string[]
+): Promise<void> {
+  if (relativePaths.length === 0) return;
+  const escaped = relativePaths
+    .map((p) => {
+      validateRelativePath(p);
+      return shellEscape(`${settings.remotePath}/${p}`);
+    })
+    .join(" ");
+  await sshExec(settings, `rm -f ${escaped}`);
+}
+
+/**
  * Build rsync SSH command args.
  */
 function buildRsyncSshArg(settings: SftpSyncSettings): string {
-  let sshCmd = `ssh -p ${settings.port}`;
+  const parts = ["ssh", "-p", String(settings.port)];
   if (settings.privateKeyPath) {
-    sshCmd += ` -i '${settings.privateKeyPath}'`;
+    parts.push("-i", settings.privateKeyPath);
   }
-  sshCmd += " -o StrictHostKeyChecking=no";
-  return sshCmd;
+  parts.push("-o", "StrictHostKeyChecking=no");
+  return parts.join(" ");
 }
 
 /**
@@ -219,7 +240,8 @@ function buildFilterArgs(settings: SftpSyncSettings, ignorePatterns: string[]): 
 export function rsyncPull(
   settings: SftpSyncSettings,
   localPath: string,
-  ignorePatterns?: string[]
+  ignorePatterns?: string[],
+  deleteSync?: boolean
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
@@ -230,8 +252,11 @@ export function rsyncPull(
       "-az",
       "-e", sshArg,
       ...buildFilterArgs(settings, ignorePatterns ?? []),
-      remote, local,
     ];
+    if (deleteSync) {
+      args.push("--delete-after");
+    }
+    args.push(remote, local);
 
     execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
@@ -247,7 +272,8 @@ export function rsyncPull(
 export function rsyncPush(
   settings: SftpSyncSettings,
   localPath: string,
-  ignorePatterns?: string[]
+  ignorePatterns?: string[],
+  deleteSync?: boolean
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
@@ -258,8 +284,11 @@ export function rsyncPush(
       "-az",
       "-e", sshArg,
       ...buildFilterArgs(settings, ignorePatterns ?? []),
-      local, remote,
     ];
+    if (deleteSync) {
+      args.push("--delete-after");
+    }
+    args.push(local, remote);
 
     execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
@@ -277,11 +306,10 @@ export function rsyncPushFile(
   localPath: string,
   relativePath: string
 ): Promise<string> {
+  validateRelativePath(relativePath);
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
     const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
-    // Use --relative with ./ marker: cd to localPath, sync ./relativePath
-    // This ensures the file ends up at remotePath/relativePath (not remotePath/relativePath/filename)
     const args = [
       "-az", "--relative",
       "-e", sshArg,
@@ -305,18 +333,17 @@ export function rsyncPullFile(
   localPath: string,
   relativePath: string
 ): Promise<string> {
+  validateRelativePath(relativePath);
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
     const remoteFile = `${settings.username}@${settings.host}:${settings.remotePath}/${relativePath}`;
 
-    // Determine the local parent directory for this file
     const localFile = `${localPath}/${relativePath}`;
     const localDir = localFile.substring(0, localFile.lastIndexOf("/"));
     if (!fs.existsSync(localDir)) {
       fs.mkdirSync(localDir, { recursive: true });
     }
 
-    // rsync remote file → exact local file path
     const args = ["-az", "-e", sshArg, remoteFile, localFile];
 
     execFile("rsync", args, { timeout: 30000 }, (err, stdout, stderr) => {

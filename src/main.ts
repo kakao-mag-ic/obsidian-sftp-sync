@@ -9,18 +9,14 @@ import {
   testSshConnection,
   listRemoteFiles,
   listRemoteChangedFiles,
+  deleteRemoteFiles,
   rsyncPull,
   rsyncPush,
   rsyncPullFile,
   rsyncPushFile,
-  sshExec,
 } from "./remote";
 import * as path from "path";
 import * as fs from "fs";
-
-// These are now read from settings, defaults here as fallback
-const DEFAULT_DEBOUNCE_MS = 5000;
-const DEFAULT_REMOTE_POLL_MS = 30000;
 
 export default class SftpSyncPlugin extends Plugin {
   settings: SftpSyncSettings = DEFAULT_SETTINGS;
@@ -31,6 +27,10 @@ export default class SftpSyncPlugin extends Plugin {
   // File watcher
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingLocalChanges: Set<string> = new Set();
+
+  // Anti-echo: files recently pulled from remote, skip in local watcher
+  private recentlyPulled: Set<string> = new Set();
+  private recentlyPulledTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
   // Remote polling
   private remotePollTimer: number | null = null;
@@ -80,6 +80,9 @@ export default class SftpSyncPlugin extends Plugin {
     this.stopAutoSync();
     this.stopRemotePoller();
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    for (const timer of this.recentlyPulledTimers.values()) {
+      clearTimeout(timer);
+    }
   }
 
   async loadSettings(): Promise<void> {
@@ -88,6 +91,20 @@ export default class SftpSyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
+  }
+
+  // ---- Anti-echo helpers ----
+
+  private markAsPulled(filePath: string): void {
+    this.recentlyPulled.add(filePath);
+    // Clear after 10 seconds
+    const existing = this.recentlyPulledTimers.get(filePath);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.recentlyPulled.delete(filePath);
+      this.recentlyPulledTimers.delete(filePath);
+    }, 10000);
+    this.recentlyPulledTimers.set(filePath, timer);
   }
 
   // ---- Connection test ----
@@ -107,6 +124,7 @@ export default class SftpSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
         if (shouldIgnore(file.path, this.settings.ignorePaths)) return;
+        if (this.recentlyPulled.has(file.path)) return; // anti-echo
         this.pendingLocalChanges.add(file.path);
         this.scheduleLocalPush();
       })
@@ -116,6 +134,7 @@ export default class SftpSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         if (shouldIgnore(file.path, this.settings.ignorePaths)) return;
+        if (this.recentlyPulled.has(file.path)) return; // anti-echo
         this.pendingLocalChanges.add(file.path);
         this.scheduleLocalPush();
       })
@@ -136,7 +155,9 @@ export default class SftpSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         if (!shouldIgnore(file.path, this.settings.ignorePaths)) {
-          this.pendingLocalChanges.add(file.path);
+          if (!this.recentlyPulled.has(file.path)) {
+            this.pendingLocalChanges.add(file.path);
+          }
         }
         if (!shouldIgnore(oldPath, this.settings.ignorePaths) && this.settings.deleteSync) {
           this.pendingLocalChanges.add(`__DELETE__:${oldPath}`);
@@ -168,9 +189,8 @@ export default class SftpSyncPlugin extends Plugin {
       for (const change of changes) {
         if (change.startsWith("__DELETE__:")) {
           const filePath = change.slice("__DELETE__:".length);
-          const remoteFull = `${this.settings.remotePath}/${filePath}`;
           try {
-            await sshExec(this.settings, `rm -f '${remoteFull}'`);
+            await deleteRemoteFiles(this.settings, [filePath]);
             await this.syncState.deleteRecord(filePath);
             syncedCount++;
           } catch (err) {
@@ -253,6 +273,7 @@ export default class SftpSyncPlugin extends Plugin {
         if (record && record.mtime >= remoteFile.mtime) continue;
 
         try {
+          this.markAsPulled(remoteFile.path); // anti-echo: suppress local watcher
           await rsyncPullFile(this.settings, vaultPath, remoteFile.path);
           await this.syncState.setRecord(remoteFile.path, {
             path: remoteFile.path,
@@ -271,7 +292,6 @@ export default class SftpSyncPlugin extends Plugin {
         new Notice(`SFTP: Pulled ${syncedCount} file(s)`);
       }
     } catch (err: any) {
-      // Connection failed, silently skip this poll
       console.error("SFTP remote poll error:", err);
     } finally {
       this.isSyncing = false;
@@ -341,11 +361,13 @@ export default class SftpSyncPlugin extends Plugin {
     direction: string,
     ignorePatterns: string[]
   ): Promise<void> {
+    const deleteSync = this.settings.deleteSync;
+
     if (direction === "push_only") {
-      await rsyncPush(this.settings, vaultPath, ignorePatterns);
+      await rsyncPush(this.settings, vaultPath, ignorePatterns, deleteSync);
       new Notice("SFTP: Push complete");
     } else if (direction === "pull_only") {
-      await rsyncPull(this.settings, vaultPath, ignorePatterns);
+      await rsyncPull(this.settings, vaultPath, ignorePatterns, deleteSync);
       new Notice("SFTP: Pull complete");
     } else {
       // bidirectional first sync: use incremental (3-way) to avoid
@@ -363,6 +385,7 @@ export default class SftpSyncPlugin extends Plugin {
       const toUpload = plan.filter((e) => e.decision === "upload").map((e) => e.path);
 
       for (const f of toDownload) {
+        this.markAsPulled(f);
         await rsyncPullFile(this.settings, vaultPath, f);
       }
       for (const f of toUpload) {
@@ -394,7 +417,6 @@ export default class SftpSyncPlugin extends Plugin {
       settings: this.settings,
     });
 
-    // Batch files by action for fewer rsync calls
     const toDownload = plan.filter((e) => e.decision === "download").map((e) => e.path);
     const toUpload = plan.filter((e) => e.decision === "upload").map((e) => e.path);
     const toDeleteLocal = plan.filter((e) => e.decision === "delete_local");
@@ -402,13 +424,14 @@ export default class SftpSyncPlugin extends Plugin {
 
     let syncedCount = 0;
 
-    // Download changed files one by one (safe, no nesting risk)
+    // Download changed files
     for (const f of toDownload) {
+      this.markAsPulled(f);
       await rsyncPullFile(this.settings, vaultPath, f);
       syncedCount++;
     }
 
-    // Upload changed files one by one (safe, no nesting risk)
+    // Upload changed files
     for (const f of toUpload) {
       await rsyncPushFile(this.settings, vaultPath, f);
       syncedCount++;
@@ -423,10 +446,12 @@ export default class SftpSyncPlugin extends Plugin {
       }
     }
 
-    // Delete remote files
+    // Delete remote files (properly escaped)
     if (toDeleteRemote.length > 0) {
-      const paths = toDeleteRemote.map((e) => `'${this.settings.remotePath}/${e.path}'`).join(" ");
-      await sshExec(this.settings, `rm -f ${paths}`);
+      await deleteRemoteFiles(
+        this.settings,
+        toDeleteRemote.map((e) => e.path)
+      );
       syncedCount += toDeleteRemote.length;
     }
 
