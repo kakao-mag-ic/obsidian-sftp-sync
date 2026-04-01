@@ -201,6 +201,32 @@ export class SftpSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Push debounce (seconds)")
+      .setDesc("Wait this long after a local change before pushing to server.")
+      .addText((text) =>
+        text
+          .setPlaceholder("5")
+          .setValue(String(this.plugin.settings.pushDebounceSec))
+          .onChange(async (value) => {
+            this.plugin.settings.pushDebounceSec = parseInt(value) || 5;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Pull interval (seconds)")
+      .setDesc("How often to check server for changes.")
+      .addText((text) =>
+        text
+          .setPlaceholder("30")
+          .setValue(String(this.plugin.settings.pullIntervalSec))
+          .onChange(async (value) => {
+            this.plugin.settings.pullIntervalSec = parseInt(value) || 30;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Max file size (MB)")
       .setDesc("Skip files larger than this size. Set to 0 to disable.")
       .addText((text) =>

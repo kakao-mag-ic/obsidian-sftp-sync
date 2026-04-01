@@ -16,6 +16,8 @@ export interface SftpSyncSettings {
   syncDirection: "bidirectional" | "pull_only" | "push_only";
   conflictStrategy: "newer_wins" | "larger_wins" | "local_wins" | "remote_wins";
   deleteSync: boolean;
+  pushDebounceSec: number;
+  pullIntervalSec: number;
 
   // Filter
   ignorePaths: string[];
@@ -39,6 +41,8 @@ export const DEFAULT_SETTINGS: SftpSyncSettings = {
   syncDirection: "bidirectional",
   conflictStrategy: "newer_wins",
   deleteSync: false,
+  pushDebounceSec: 5,
+  pullIntervalSec: 30,
   ignorePaths: [
     ".obsidian",
     ".git",

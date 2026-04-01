@@ -18,8 +18,9 @@ import {
 import * as path from "path";
 import * as fs from "fs";
 
-const DEBOUNCE_MS = 5000;
-const REMOTE_POLL_MS = 30000;
+// These are now read from settings, defaults here as fallback
+const DEFAULT_DEBOUNCE_MS = 5000;
+const DEFAULT_REMOTE_POLL_MS = 30000;
 
 export default class SftpSyncPlugin extends Plugin {
   settings: SftpSyncSettings = DEFAULT_SETTINGS;
@@ -147,7 +148,8 @@ export default class SftpSyncPlugin extends Plugin {
 
   private scheduleLocalPush(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(() => this.flushLocalChanges(), DEBOUNCE_MS);
+    const debounceMs = (this.settings.pushDebounceSec || 5) * 1000;
+    this.debounceTimer = setTimeout(() => this.flushLocalChanges(), debounceMs);
   }
 
   private async flushLocalChanges(): Promise<void> {
@@ -212,9 +214,10 @@ export default class SftpSyncPlugin extends Plugin {
     if (direction === "push_only") return;
 
     this.lastRemotePollTime = Date.now();
+    const pollMs = (this.settings.pullIntervalSec || 30) * 1000;
     this.remotePollTimer = window.setInterval(
       () => this.pollRemoteChanges(),
-      REMOTE_POLL_MS
+      pollMs
     );
     this.registerInterval(this.remotePollTimer);
   }
