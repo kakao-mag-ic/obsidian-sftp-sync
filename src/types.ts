@@ -26,6 +26,7 @@ export interface SftpSyncSettings {
   // Connection tuning
   connectTimeoutMs: number;
   maxRetries: number;
+  strictHostKeyChecking: boolean;
 }
 
 export const DEFAULT_SETTINGS: SftpSyncSettings = {
@@ -54,6 +55,7 @@ export const DEFAULT_SETTINGS: SftpSyncSettings = {
   maxFileSizeMB: 100,
   connectTimeoutMs: 5000,
   maxRetries: 2,
+  strictHostKeyChecking: false,
 };
 
 export interface FileInfo {
