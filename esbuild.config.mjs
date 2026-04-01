@@ -18,9 +18,6 @@ esbuild
     external: [
       "obsidian",
       "electron",
-      "ssh2",
-      "ssh2-sftp-client",
-      "cpu-features",
       "@codemirror/autocomplete",
       "@codemirror/collab",
       "@codemirror/commands",
@@ -34,6 +31,9 @@ esbuild
       "@lezer/lr",
       ...builtins,
     ],
+    loader: {
+      ".node": "empty",
+    },
     format: "cjs",
     target: "es2020",
     logLevel: "info",

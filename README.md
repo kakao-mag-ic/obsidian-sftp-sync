@@ -35,13 +35,8 @@ node esbuild.config.mjs production
 # 플러그인 디렉토리 생성
 mkdir -p <your-vault>/.obsidian/plugins/obsidian-sftp-sync
 
-# 빌드 결과물 복사
+# 빌드 결과물 복사 (main.js에 모든 의존성이 번들링되어 있음)
 cp main.js manifest.json <your-vault>/.obsidian/plugins/obsidian-sftp-sync/
-
-# ssh2 네이티브 모듈 설치 (플러그인 폴더에서 실행)
-cd <your-vault>/.obsidian/plugins/obsidian-sftp-sync
-npm init -y
-npm install ssh2-sftp-client
 ```
 
 > `<your-vault>`는 본인의 Obsidian vault 경로로 대체하세요.
