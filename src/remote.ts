@@ -270,6 +270,7 @@ export function rsyncPush(
 
 /**
  * Rsync a single file from local to remote.
+ * Uses --relative to preserve directory structure without nesting.
  */
 export function rsyncPushFile(
   settings: SftpSyncSettings,
@@ -278,12 +279,17 @@ export function rsyncPushFile(
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
-    const localFile = `${localPath}/${relativePath}`;
-    const remoteDir = `${settings.username}@${settings.host}:${settings.remotePath}/${relativePath}`;
+    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
+    // Use --relative with ./ marker: cd to localPath, sync ./relativePath
+    // This ensures the file ends up at remotePath/relativePath (not remotePath/relativePath/filename)
+    const args = [
+      "-az", "--relative",
+      "-e", sshArg,
+      `./${relativePath}`,
+      remote,
+    ];
 
-    const args = ["-az", "-e", sshArg, localFile, remoteDir];
-
-    execFile("rsync", args, { timeout: 30000 }, (err, stdout, stderr) => {
+    execFile("rsync", args, { cwd: localPath, timeout: 30000 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       resolve(stdout);
     });
@@ -292,6 +298,7 @@ export function rsyncPushFile(
 
 /**
  * Rsync a single file from remote to local.
+ * Downloads to the correct relative path under localPath.
  */
 export function rsyncPullFile(
   settings: SftpSyncSettings,
@@ -301,14 +308,15 @@ export function rsyncPullFile(
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
     const remoteFile = `${settings.username}@${settings.host}:${settings.remotePath}/${relativePath}`;
-    const localFile = `${localPath}/${relativePath}`;
 
-    // Ensure local directory exists
-    const dir = localFile.substring(0, localFile.lastIndexOf("/"));
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    // Determine the local parent directory for this file
+    const localFile = `${localPath}/${relativePath}`;
+    const localDir = localFile.substring(0, localFile.lastIndexOf("/"));
+    if (!fs.existsSync(localDir)) {
+      fs.mkdirSync(localDir, { recursive: true });
     }
 
+    // rsync remote file → exact local file path
     const args = ["-az", "-e", sshArg, remoteFile, localFile];
 
     execFile("rsync", args, { timeout: 30000 }, (err, stdout, stderr) => {

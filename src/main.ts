@@ -348,10 +348,27 @@ export default class SftpSyncPlugin extends Plugin {
       await rsyncPull(this.settings, vaultPath, ignorePatterns);
       new Notice("SFTP: Pull complete");
     } else {
-      // bidirectional first sync: pull first, then push
-      await rsyncPull(this.settings, vaultPath, ignorePatterns);
-      await rsyncPush(this.settings, vaultPath, ignorePatterns);
-      new Notice("SFTP: Initial sync complete");
+      // bidirectional first sync: use incremental (3-way) to avoid
+      // pull→push creating duplicate nested folders
+      const remoteFiles = await listRemoteFiles(this.settings, ignorePatterns);
+      const localFiles = this.collectLocalFiles(vaultPath);
+      const plan = buildSyncPlan({
+        localFiles,
+        remoteFiles,
+        prevRecords: new Map(),
+        settings: this.settings,
+      });
+
+      const toDownload = plan.filter((e) => e.decision === "download").map((e) => e.path);
+      const toUpload = plan.filter((e) => e.decision === "upload").map((e) => e.path);
+
+      for (const f of toDownload) {
+        await rsyncPullFile(this.settings, vaultPath, f);
+      }
+      for (const f of toUpload) {
+        await rsyncPushFile(this.settings, vaultPath, f);
+      }
+      new Notice(`SFTP: Initial sync complete (↓${toDownload.length} ↑${toUpload.length})`);
     }
 
     // Rebuild sync records from current local state
@@ -385,29 +402,16 @@ export default class SftpSyncPlugin extends Plugin {
 
     let syncedCount = 0;
 
-    // Batch download with single rsync
-    if (toDownload.length > 0) {
-      if (toDownload.length > 10) {
-        // Many files: full rsync is faster
-        await rsyncPull(this.settings, vaultPath, ignorePatterns);
-      } else {
-        for (const f of toDownload) {
-          await rsyncPullFile(this.settings, vaultPath, f);
-        }
-      }
-      syncedCount += toDownload.length;
+    // Download changed files one by one (safe, no nesting risk)
+    for (const f of toDownload) {
+      await rsyncPullFile(this.settings, vaultPath, f);
+      syncedCount++;
     }
 
-    // Batch upload with single rsync
-    if (toUpload.length > 0) {
-      if (toUpload.length > 10) {
-        await rsyncPush(this.settings, vaultPath, ignorePatterns);
-      } else {
-        for (const f of toUpload) {
-          await rsyncPushFile(this.settings, vaultPath, f);
-        }
-      }
-      syncedCount += toUpload.length;
+    // Upload changed files one by one (safe, no nesting risk)
+    for (const f of toUpload) {
+      await rsyncPushFile(this.settings, vaultPath, f);
+      syncedCount++;
     }
 
     // Delete local files
