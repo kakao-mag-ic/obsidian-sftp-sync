@@ -198,13 +198,16 @@ function buildRsyncSshArg(settings: SftpSyncSettings): string {
 }
 
 /**
- * Build --exclude args for rsync from ignore patterns.
+ * Build common rsync args: --exclude patterns and --max-size.
  */
-function buildExcludeArgs(ignorePatterns: string[]): string[] {
+function buildFilterArgs(settings: SftpSyncSettings, ignorePatterns: string[]): string[] {
   const args: string[] = [];
   for (const p of ignorePatterns) {
     const pattern = p.endsWith("/") ? p.slice(0, -1) : p;
     args.push("--exclude", pattern);
+  }
+  if (settings.maxFileSizeMB > 0) {
+    args.push("--max-size", `${settings.maxFileSizeMB}m`);
   }
   return args;
 }
@@ -226,7 +229,7 @@ export function rsyncPull(
     const args = [
       "-az",
       "-e", sshArg,
-      ...buildExcludeArgs(ignorePatterns ?? []),
+      ...buildFilterArgs(settings, ignorePatterns ?? []),
       remote, local,
     ];
 
@@ -254,7 +257,7 @@ export function rsyncPush(
     const args = [
       "-az",
       "-e", sshArg,
-      ...buildExcludeArgs(ignorePatterns ?? []),
+      ...buildFilterArgs(settings, ignorePatterns ?? []),
       local, remote,
     ];
 

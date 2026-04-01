@@ -19,6 +19,7 @@ export interface SftpSyncSettings {
 
   // Filter
   ignorePaths: string[];
+  maxFileSizeMB: number;
 
   // Connection tuning
   connectTimeoutMs: number;
@@ -46,6 +47,7 @@ export const DEFAULT_SETTINGS: SftpSyncSettings = {
     "*.pyc",
     ".env",
   ],
+  maxFileSizeMB: 100,
   connectTimeoutMs: 5000,
   maxRetries: 2,
 };

@@ -200,6 +200,19 @@ export class SftpSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    new Setting(containerEl)
+      .setName("Max file size (MB)")
+      .setDesc("Skip files larger than this size. Set to 0 to disable.")
+      .addText((text) =>
+        text
+          .setPlaceholder("100")
+          .setValue(String(this.plugin.settings.maxFileSizeMB))
+          .onChange(async (value) => {
+            this.plugin.settings.maxFileSizeMB = parseInt(value) || 0;
+            await this.plugin.saveSettings();
+          })
+      );
+
     // --- Filter ---
     containerEl.createEl("h2", { text: "Filter" });
 
