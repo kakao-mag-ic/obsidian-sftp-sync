@@ -9,6 +9,8 @@ import {
   testSshConnection,
   listRemoteFiles,
   listRemoteChangedFiles,
+  rsyncPull,
+  rsyncPush,
   rsyncPullFile,
   rsyncPushFile,
   sshExec,
@@ -303,70 +305,20 @@ export default class SftpSyncPlugin extends Plugin {
     this.updateStatusBar("syncing");
 
     try {
-      // Collect remote files via SSH find
-      const remoteFiles = await listRemoteFiles(this.settings, this.settings.ignorePaths);
-
-      // Collect local files
       const vaultPath = (this.app.vault.adapter as any).getBasePath();
-      const localFiles = this.collectLocalFiles(vaultPath);
-      const filteredLocal = localFiles.filter(
-        (f) => !shouldIgnore(f.path, this.settings.ignorePaths)
-      );
-
-      // Load previous sync records
       const prevRecords = await this.syncState.load();
+      const direction = this.settings.syncDirection;
+      const ignore = this.settings.ignorePaths;
 
-      // Build sync plan
-      const plan = buildSyncPlan({
-        localFiles: filteredLocal,
-        remoteFiles,
-        prevRecords,
-        settings: this.settings,
-      });
-
-      // Execute plan using rsync
-      let syncedCount = 0;
-      for (const entity of plan) {
-        try {
-          if (entity.decision === "download" && entity.remote) {
-            await rsyncPullFile(this.settings, vaultPath, entity.path);
-            await this.syncState.setRecord(entity.path, {
-              path: entity.path,
-              mtime: entity.remote.mtime,
-              size: entity.remote.size,
-            });
-            syncedCount++;
-          } else if (entity.decision === "upload" && entity.local) {
-            await rsyncPushFile(this.settings, vaultPath, entity.path);
-            await this.syncState.setRecord(entity.path, {
-              path: entity.path,
-              mtime: entity.local.mtime,
-              size: entity.local.size,
-            });
-            syncedCount++;
-          } else if (entity.decision === "delete_local") {
-            const localFull = path.join(vaultPath, entity.path);
-            if (fs.existsSync(localFull)) {
-              fs.unlinkSync(localFull);
-              await this.syncState.deleteRecord(entity.path);
-              syncedCount++;
-            }
-          } else if (entity.decision === "delete_remote") {
-            const remoteFull = `${this.settings.remotePath}/${entity.path}`;
-            await sshExec(this.settings, `rm -f '${remoteFull}'`);
-            await this.syncState.deleteRecord(entity.path);
-            syncedCount++;
-          }
-        } catch (err) {
-          console.error(`SFTP: Failed to sync ${entity.path}`, err);
-        }
+      // First sync or simple direction: use single rsync call (fast!)
+      if (prevRecords.size === 0 || direction !== "bidirectional") {
+        await this.runBulkSync(vaultPath, direction, ignore);
+      } else {
+        await this.runIncrementalSync(vaultPath, prevRecords, ignore);
       }
 
       this.lastRemotePollTime = Date.now();
       this.updateStatusBar("success");
-      if (syncedCount > 0) {
-        new Notice(`SFTP: Synced ${syncedCount} file(s)`);
-      }
     } catch (err: any) {
       console.error("SFTP sync error:", err);
       this.updateStatusBar("failed");
@@ -374,6 +326,121 @@ export default class SftpSyncPlugin extends Plugin {
     } finally {
       this.isSyncing = false;
     }
+  }
+
+  /**
+   * Bulk sync using a single rsync call. Used for:
+   * - First sync (no previous records)
+   * - pull_only / push_only modes
+   */
+  private async runBulkSync(
+    vaultPath: string,
+    direction: string,
+    ignorePatterns: string[]
+  ): Promise<void> {
+    if (direction === "push_only") {
+      await rsyncPush(this.settings, vaultPath, ignorePatterns);
+      new Notice("SFTP: Push complete");
+    } else if (direction === "pull_only") {
+      await rsyncPull(this.settings, vaultPath, ignorePatterns);
+      new Notice("SFTP: Pull complete");
+    } else {
+      // bidirectional first sync: pull first, then push
+      await rsyncPull(this.settings, vaultPath, ignorePatterns);
+      await rsyncPush(this.settings, vaultPath, ignorePatterns);
+      new Notice("SFTP: Initial sync complete");
+    }
+
+    // Rebuild sync records from current local state
+    await this.rebuildSyncRecords(vaultPath);
+  }
+
+  /**
+   * Incremental sync using 3-way comparison. Used for subsequent
+   * bidirectional syncs where we need conflict detection.
+   */
+  private async runIncrementalSync(
+    vaultPath: string,
+    prevRecords: Map<string, SyncRecord>,
+    ignorePatterns: string[]
+  ): Promise<void> {
+    const remoteFiles = await listRemoteFiles(this.settings, ignorePatterns);
+    const localFiles = this.collectLocalFiles(vaultPath);
+
+    const plan = buildSyncPlan({
+      localFiles,
+      remoteFiles,
+      prevRecords,
+      settings: this.settings,
+    });
+
+    // Batch files by action for fewer rsync calls
+    const toDownload = plan.filter((e) => e.decision === "download").map((e) => e.path);
+    const toUpload = plan.filter((e) => e.decision === "upload").map((e) => e.path);
+    const toDeleteLocal = plan.filter((e) => e.decision === "delete_local");
+    const toDeleteRemote = plan.filter((e) => e.decision === "delete_remote");
+
+    let syncedCount = 0;
+
+    // Batch download with single rsync
+    if (toDownload.length > 0) {
+      if (toDownload.length > 10) {
+        // Many files: full rsync is faster
+        await rsyncPull(this.settings, vaultPath, ignorePatterns);
+      } else {
+        for (const f of toDownload) {
+          await rsyncPullFile(this.settings, vaultPath, f);
+        }
+      }
+      syncedCount += toDownload.length;
+    }
+
+    // Batch upload with single rsync
+    if (toUpload.length > 0) {
+      if (toUpload.length > 10) {
+        await rsyncPush(this.settings, vaultPath, ignorePatterns);
+      } else {
+        for (const f of toUpload) {
+          await rsyncPushFile(this.settings, vaultPath, f);
+        }
+      }
+      syncedCount += toUpload.length;
+    }
+
+    // Delete local files
+    for (const entity of toDeleteLocal) {
+      const localFull = path.join(vaultPath, entity.path);
+      if (fs.existsSync(localFull)) {
+        fs.unlinkSync(localFull);
+        syncedCount++;
+      }
+    }
+
+    // Delete remote files
+    if (toDeleteRemote.length > 0) {
+      const paths = toDeleteRemote.map((e) => `'${this.settings.remotePath}/${e.path}'`).join(" ");
+      await sshExec(this.settings, `rm -f ${paths}`);
+      syncedCount += toDeleteRemote.length;
+    }
+
+    // Update sync records
+    await this.rebuildSyncRecords(vaultPath);
+
+    if (syncedCount > 0) {
+      new Notice(`SFTP: Synced ${syncedCount} file(s)`);
+    }
+  }
+
+  /**
+   * Rebuild sync records from current local file state.
+   */
+  private async rebuildSyncRecords(vaultPath: string): Promise<void> {
+    const localFiles = this.collectLocalFiles(vaultPath);
+    const records = new Map<string, SyncRecord>();
+    for (const f of localFiles) {
+      records.set(f.path, { path: f.path, mtime: f.mtime, size: f.size });
+    }
+    await this.syncState.save(records);
   }
 
   // ---- Local file collection ----

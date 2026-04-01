@@ -183,7 +183,7 @@ describe("rsync", () => {
 
     expect(execFile).toHaveBeenCalledWith(
       "rsync",
-      expect.arrayContaining(["-az", "--delete-after"]),
+      expect.arrayContaining(["-az"]),
       expect.any(Object),
       expect.any(Function)
     );

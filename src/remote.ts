@@ -198,54 +198,25 @@ function buildRsyncSshArg(settings: SftpSyncSettings): string {
 }
 
 /**
- * Rsync files from remote to local.
- * @param files - specific files to sync (relative paths). If empty, syncs all.
+ * Build --exclude args for rsync from ignore patterns.
+ */
+function buildExcludeArgs(ignorePatterns: string[]): string[] {
+  const args: string[] = [];
+  for (const p of ignorePatterns) {
+    const pattern = p.endsWith("/") ? p.slice(0, -1) : p;
+    args.push("--exclude", pattern);
+  }
+  return args;
+}
+
+/**
+ * Rsync full directory from remote to local.
+ * Single rsync call — fast for first sync and bulk operations.
  */
 export function rsyncPull(
   settings: SftpSyncSettings,
   localPath: string,
-  files?: string[]
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const sshArg = buildRsyncSshArg(settings);
-    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
-    const local = localPath.endsWith("/") ? localPath : `${localPath}/`;
-
-    const args = [
-      "-az", "--delete-after",
-      "-e", sshArg,
-    ];
-
-    if (files && files.length > 0) {
-      // Sync only specific files
-      for (const f of files) {
-        args.push("--include", f);
-        // Include parent directories
-        const parts = f.split("/");
-        for (let i = 1; i < parts.length; i++) {
-          args.push("--include", parts.slice(0, i).join("/") + "/");
-        }
-      }
-      args.push("--exclude", "*");
-    }
-
-    args.push(remote, local);
-
-    execFile("rsync", args, { timeout: 60000 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(stdout);
-    });
-  });
-}
-
-/**
- * Rsync files from local to remote.
- * @param files - specific files to sync (relative paths). If empty, syncs all.
- */
-export function rsyncPush(
-  settings: SftpSyncSettings,
-  localPath: string,
-  files?: string[]
+  ignorePatterns?: string[]
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const sshArg = buildRsyncSshArg(settings);
@@ -255,22 +226,39 @@ export function rsyncPush(
     const args = [
       "-az",
       "-e", sshArg,
+      ...buildExcludeArgs(ignorePatterns ?? []),
+      remote, local,
     ];
 
-    if (files && files.length > 0) {
-      for (const f of files) {
-        args.push("--include", f);
-        const parts = f.split("/");
-        for (let i = 1; i < parts.length; i++) {
-          args.push("--include", parts.slice(0, i).join("/") + "/");
-        }
-      }
-      args.push("--exclude", "*");
-    }
+    execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
+    });
+  });
+}
 
-    args.push(local, remote);
+/**
+ * Rsync full directory from local to remote.
+ * Single rsync call — fast for bulk push.
+ */
+export function rsyncPush(
+  settings: SftpSyncSettings,
+  localPath: string,
+  ignorePatterns?: string[]
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const sshArg = buildRsyncSshArg(settings);
+    const remote = `${settings.username}@${settings.host}:${settings.remotePath}/`;
+    const local = localPath.endsWith("/") ? localPath : `${localPath}/`;
 
-    execFile("rsync", args, { timeout: 60000 }, (err, stdout, stderr) => {
+    const args = [
+      "-az",
+      "-e", sshArg,
+      ...buildExcludeArgs(ignorePatterns ?? []),
+      local, remote,
+    ];
+
+    execFile("rsync", args, { timeout: 300000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(stderr || err.message));
       resolve(stdout);
     });
